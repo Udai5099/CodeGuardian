@@ -32,28 +32,83 @@ class ReviewService:
         self._parser_service = parser_service or ParserService()
         self._knowledge_graph_service = knowledge_graph_service or KnowledgeGraphService()
 
-    def review_diff(self, repository_path: str) -> ReviewResult:
+    def review_diff(
+        self,
+        repository_path: str,
+        base_sha: str = "",
+        head_sha: str = "",
+        changed_files: list[str] | None = None,
+    ) -> ReviewResult:
         repo_path = Path(repository_path)
+
+        if base_sha and head_sha:
+            diff_command = [
+                "git",
+                "diff",
+                "--unified=80",
+                base_sha,
+                head_sha,
+            ]
+        else:
+            diff_command = [
+                "git",
+                "diff",
+                "--unified=80",
+            ]
+
         diff_output = subprocess.run(
-            ["git", "diff", "--name-only"],
+            diff_command,
             cwd=repo_path,
             capture_output=True,
             text=True,
             check=True,
         )
-        changed_files = [line for line in diff_output.stdout.splitlines() if line.strip()]
-        summary = f"{len(changed_files)} file changed" if len(changed_files) == 1 else f"{len(changed_files)} files changed"
+
+        diff_text = diff_output.stdout
+
+        if changed_files is None:
+            changed_files_output = subprocess.run(
+                [
+                    "git",
+                    "diff",
+                    "--name-only",
+                    base_sha,
+                    head_sha,
+                ]
+                if base_sha and head_sha
+                else ["git", "diff", "--name-only"],
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+
+            changed_files = [
+                line
+                for line in changed_files_output.stdout.splitlines()
+                if line.strip()
+            ]
+
+        summary = (
+            f"{len(changed_files)} file changed"
+            if len(changed_files) == 1
+            else f"{len(changed_files)} files changed"
+        )
 
         knowledge_graph = self._knowledge_graph_service.build(repository_path)
+
         findings: list[ReviewFinding] = []
-        for parsed_change in self._parser_service.parse_changes(repository_path):
-            if self._parser_service.detect_style_issue(parsed_change.content):
+
+        # Review the actual PR diff rather than the clean working tree.
+        if diff_text.strip():
+            if self._parser_service.detect_style_issue(diff_text):
                 findings.append(
                     ReviewFinding(
                         category="style",
                         message=(
-                            f"Potential style issue in {parsed_change.file_path} "
-                            f"using repository context with {knowledge_graph.module_count} modules"
+                            "Potential style issue detected in the pull request diff using repository context; "
+                            f"the repository context includes {knowledge_graph.file_count} files and "
+                            f"{knowledge_graph.module_count} modules."
                         ),
                     )
                 )
@@ -61,12 +116,17 @@ class ReviewService:
         if not findings:
             findings.append(
                 ReviewFinding(
-                    category="style",
+                    category="review",
                     message=(
-                        "No obvious issues found; repository context includes "
-                        f"{knowledge_graph.file_count} files and {knowledge_graph.module_count} modules"
+                        "No obvious issues found in the supplied pull request diff. "
+                        f"Repository context includes {knowledge_graph.file_count} "
+                        f"files and {knowledge_graph.module_count} modules."
                     ),
                 )
             )
 
-        return ReviewResult(review_id="review-001", summary=summary, findings=findings)
+        return ReviewResult(
+            review_id="review-001",
+            summary=summary,
+            findings=findings,
+        )

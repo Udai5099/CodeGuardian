@@ -1,24 +1,36 @@
 from contextlib import asynccontextmanager
+import hashlib
+import hmac
+import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import tempfile
+import time
+from urllib.parse import urlencode
 
-from fastapi import FastAPI, HTTPException, Request
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.app.core.events import EventBus
 from backend.app.core.settings import settings
 from backend.app.modules.ai.service import HeuristicReviewAgent
+from backend.app.modules.agent.memory import create_repository_memory_store
+from backend.app.modules.agent.service import PullRequestReviewAgent
 from backend.app.modules.embeddings.service import EmbeddingRetrievalService
+from backend.app.modules.github.auth import get_installation_access_token
+from backend.app.infrastructure.activity_store import RepositoryActivity, create_activity_store
 from backend.app.modules.indexing.service import IndexingService
 from backend.app.modules.knowledge.service import KnowledgeGraphService
 from backend.app.modules.repository.service import RepositoryAccessError, RepositoryIntelligenceService
 from backend.app.modules.review.repository import ReviewRecord, ReviewRepository
 from backend.app.modules.review.service import ReviewService
 from backend.app.modules.review.workflows import ReviewWorkflowEngine, WorkflowStep
+from backend.app.modules.vector.service import RepositoryVectorService, create_vector_store
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
@@ -28,12 +40,16 @@ async def lifespan(application: FastAPI):
         owner_file = stale_cache / ".owner"
         try:
             owner_pid = int(owner_file.read_text(encoding="utf-8"))
-            os.kill(owner_pid, 0)
-            owner_is_running = True
-        except (FileNotFoundError, ProcessLookupError, ValueError):
+            if os.name == "nt":
+                owner_is_running = _windows_process_exists(owner_pid)
+            else:
+                try:
+                    os.kill(owner_pid, 0)
+                    owner_is_running = True
+                except (ProcessLookupError, PermissionError, OSError):
+                    owner_is_running = False
+        except (FileNotFoundError, ValueError):
             owner_is_running = False
-        except PermissionError:
-            owner_is_running = True
         if stale_cache.is_dir() and not owner_is_running:
             shutil.rmtree(stale_cache, ignore_errors=True)
 
@@ -42,6 +58,20 @@ async def lifespan(application: FastAPI):
         (cache_path / ".owner").write_text(str(os.getpid()), encoding="utf-8")
         application.state.repository_service.set_cache_root(cache_path)
         yield
+
+
+def _windows_process_exists(pid: int) -> bool:
+    """Check whether a Windows process ID is still alive."""
+    try:
+        import ctypes
+
+        process_handle = ctypes.windll.kernel32.OpenProcess(0x100000, False, pid)
+        if not process_handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(process_handle)
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
 
 
 app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
@@ -57,10 +87,73 @@ app.state.repository_service = RepositoryIntelligenceService()
 app.state.review_service = ReviewService()
 app.state.knowledge_service = KnowledgeGraphService()
 app.state.ai_agent = HeuristicReviewAgent()
+app.state.repository_memory = create_repository_memory_store(settings.redis_url)
+app.state.pr_review_agent = PullRequestReviewAgent(
+    app.state.repository_memory,
+    knowledge_service=app.state.knowledge_service,
+    review_service=app.state.review_service,
+)
+app.state.activity_store = create_activity_store(settings.database_url)
+app.state.vector_store = create_vector_store(settings.database_url)
+app.state.vector_service = RepositoryVectorService(app.state.vector_store)
 app.state.review_repository = ReviewRepository()
-app.state.review_workflow = ReviewWorkflowEngine(app.state.event_bus)
 app.state.indexing_service = IndexingService()
 app.state.retrieval_service = EmbeddingRetrievalService()
+app.state.review_workflow = ReviewWorkflowEngine(
+    app.state.event_bus,
+    repository_service=app.state.repository_service,
+    knowledge_service=app.state.knowledge_service,
+    review_service=app.state.review_service,
+    retrieval_service=app.state.retrieval_service,
+    ai_agent=app.state.ai_agent,
+)
+
+
+def _get_oauth_state_store() -> object:
+    """Return a Redis client when configured, otherwise a per-process in-memory fallback."""
+    if settings.redis_url:
+        try:
+            import redis
+
+            return redis.Redis.from_url(settings.redis_url, decode_responses=True)
+        except Exception:
+            pass
+
+    if not hasattr(app.state, "oauth_state_store"):
+        app.state.oauth_state_store = {}
+    return app.state.oauth_state_store
+
+
+def _oauth_state_key(state: str) -> str:
+    return f"codexguardian:oauth-state:{state}"
+
+
+def _save_oauth_state(state: str, *, ttl_seconds: int = 600) -> None:
+    store = _get_oauth_state_store()
+    if hasattr(store, "set"):
+        store.set(_oauth_state_key(state), "valid", ex=ttl_seconds)
+        return
+
+    expires_at = time.time() + ttl_seconds
+    store[state] = {"expires_at": expires_at}
+
+
+def _consume_oauth_state(state: str | None) -> bool:
+    if not state:
+        return False
+
+    store = _get_oauth_state_store()
+    if hasattr(store, "delete"):
+        return bool(store.delete(_oauth_state_key(state)))
+
+    record = store.get(state)
+    if record is None:
+        return False
+    if record.get("expires_at", 0) < time.time():
+        store.pop(state, None)
+        return False
+    store.pop(state, None)
+    return True
 
 
 def resolve_repository(payload: dict[str, str], require_git: bool = False) -> str:
@@ -125,12 +218,15 @@ def module_registry() -> dict[str, list[str]]:
 @app.post("/api/v1/repository/analyze")
 def analyze_repository(payload: dict[str, str]) -> dict[str, object]:
     repository_path = resolve_repository(payload, require_git=True)
+    repository_id = payload.get("repository_url") or str(Path(repository_path).resolve())
     analysis = app.state.repository_service.analyze(repository_path)
+    vector_count = app.state.vector_service.index_repository(repository_id, repository_path)
     return {
         "repository_name": analysis.repository_name,
         "is_dirty": analysis.is_dirty,
         "changed_files": analysis.changed_files,
         "head_commit": analysis.head_commit,
+        "vector_index": {"storage": app.state.vector_service.storage_name, "files_indexed": vector_count},
         "analysis_overview": (
             "Repository analysis checks the Git working tree and identifies the current commit "
             "so you can understand the state of the codebase before running a review."
@@ -249,6 +345,267 @@ def retrieve_context(payload: dict[str, str]) -> dict[str, object]:
             for result in results
         ],
     }
+
+
+@app.post("/api/v1/vector/index")
+def index_repository_vectors(payload: dict[str, str]) -> dict[str, object]:
+    repository_path = resolve_repository(payload)
+    repository_id = payload.get("repository_url") or str(Path(repository_path).resolve())
+    indexed_files = app.state.vector_service.index_repository(repository_id, repository_path)
+    return {
+        "repository_id": repository_id,
+        "indexed_files": indexed_files,
+        "storage": app.state.vector_service.storage_name,
+        "embedding_dimensions": 384,
+    }
+
+
+def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
+    installation_id = str(payload.get("installation_id") or "").strip()
+    installation_token = str(payload.get("installation_token") or "").strip()
+
+    if installation_id:
+        if not installation_token:
+            try:
+                installation_token = get_installation_access_token(installation_id)
+            except Exception as error:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Could not authenticate GitHub App installation: {type(error).__name__}.",
+                ) from error
+
+        repository_url = str(payload.get("repository_url") or "").strip()
+        head_sha = str(payload.get("head_sha") or "").strip()
+
+        if not repository_url:
+            raise HTTPException(status_code=400, detail="GitHub repository URL is missing.")
+
+        try:
+            repository_path = app.state.repository_service.resolve_github_repository(
+                repository_url=repository_url,
+                installation_token=installation_token,
+                base_sha=str(payload.get("base_sha") or ""),
+                head_sha=head_sha,
+            )
+        except RepositoryAccessError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    else:
+        repository_path = resolve_repository(payload, require_git=True)  # type: ignore[arg-type]
+
+    repository_id = str(payload.get("repository_url") or Path(repository_path).resolve())
+    repository_name = Path(repository_path).name
+    user_id = str(payload.get("user_id") or "anonymous")
+    pr_number = int(payload.get("pull_request_number", 0))
+    if pr_number <= 0:
+        raise HTTPException(status_code=400, detail="pull_request_number must be a positive integer.")
+    base_sha = str(payload.get("base_sha", ""))
+    head_sha = str(payload.get("head_sha", ""))
+    if payload.get("repository_url") and not payload.get("installation_id"):
+        try:
+            app.state.repository_service.fetch_revisions(
+                repository_path,
+                [base_sha, head_sha],
+            )
+        except RepositoryAccessError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+    vector_count = app.state.vector_service.index_repository(repository_id, repository_path)
+
+    if payload.get("merged") is True:
+        memory = app.state.pr_review_agent.remember_merged_repository(repository_id, repository_path, pr_number)
+        activity = app.state.activity_store.record(
+            RepositoryActivity(user_id, repository_id, repository_name, 0, "merged-pr-memory-saved", last_commit_sha=memory.commit_sha)
+        )
+        return {
+            "agent_name": "pull-request-review-agent",
+            "status": "repository-memory-updated",
+            "storage": app.state.repository_memory.storage_name,
+            "message": "Merged PR analysis saved as the baseline for future pull-request reviews.",
+            "baseline_commit": memory.commit_sha,
+            "file_count": memory.file_count,
+            "module_count": memory.module_count,
+            "vector_index": {"storage": app.state.vector_service.storage_name, "files_indexed": vector_count},
+            "activity": activity_response(activity),
+        }
+
+    review = app.state.pr_review_agent.review_pull_request(
+        repository_id, repository_path, pr_number, base_sha, head_sha
+    )
+    activity = app.state.activity_store.record(
+        RepositoryActivity(user_id, repository_id, repository_name, 0, "pull-request-reviewed", last_commit_sha=review.baseline_commit)
+    )
+    return {
+        "agent_name": review.agent_name,
+        "status": "review-complete",
+        "storage": app.state.repository_memory.storage_name,
+        "pull_request_number": review.pull_request_number,
+        "changed_files": review.changed_files,
+        "summary": review.summary,
+        "findings": review.findings,
+        "confidence": review.confidence,
+        "confidence_reasons": review.confidence_reasons,
+        "baseline_commit": review.baseline_commit,
+        "recommendation": review.recommendation,
+        "vector_index": {"storage": app.state.vector_service.storage_name, "files_indexed": vector_count},
+        "activity": activity_response(activity),
+    }
+
+
+def activity_response(activity: RepositoryActivity) -> dict[str, object]:
+    return {
+        "storage": app.state.activity_store.storage_name,
+        "user_id": activity.user_id,
+        "repository_name": activity.repository_name,
+        "action_count": activity.action_count,
+        "last_action": activity.last_action,
+        "last_updated_at": activity.last_updated_at.isoformat() if activity.last_updated_at else None,
+        "last_commit_sha": activity.last_commit_sha,
+    }
+
+
+@app.get("/api/v1/repository/activity")
+def repository_activity(user_id: str, repository_id: str) -> dict[str, object]:
+    activity = app.state.activity_store.get(user_id, repository_id)
+    if not activity:
+        raise HTTPException(status_code=404, detail="No activity found for this user and repository.")
+    return activity_response(activity)
+
+
+@app.post("/api/v1/agent/pr-review")
+def review_pull_request(payload: dict[str, object]) -> dict[str, object]:
+    """Run an incremental PR review or record the baseline after a merge."""
+    return run_pull_request_agent(payload)
+
+
+@app.get("/api/v1/github/connection")
+def github_connection() -> dict[str, object]:
+    secret = settings.github_webhook_secret or ""
+    return {
+        "github_app_id_configured": bool(settings.github_app_id),
+        "webhook_secret_configured": bool(secret and not secret.startswith("replace-with")),
+        "webhook_endpoint": "/api/v1/webhooks/github",
+    }
+
+
+@app.get("/api/v1/github/authorize")
+def github_authorize() -> RedirectResponse:
+    """Redirect the user to GitHub's OAuth authorization page."""
+    client_id = os.getenv("GITHUB_CLIENT_ID") or settings.github_client_id
+    redirect_uri = os.getenv("GITHUB_OAUTH_REDIRECT_URL") or settings.github_oauth_redirect_url
+
+    if not client_id or not redirect_uri:
+        raise HTTPException(status_code=503, detail="GitHub OAuth client settings are not configured.")
+
+    state = secrets.token_urlsafe(32)
+    _save_oauth_state(state)
+
+    params = urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "scope": "read:user user:email",
+        }
+    )
+
+    return RedirectResponse(url=f"https://github.com/login/oauth/authorize?{params}")
+
+@app.get("/api/v1/github/callback")
+def github_callback(code: str | None = None, state: str | None = None) -> dict[str, object]:
+    """Exchange the GitHub OAuth code without exposing the resulting token."""
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing GitHub OAuth code.")
+
+    if not _consume_oauth_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired GitHub OAuth state.")
+
+    client_id = os.getenv("GITHUB_CLIENT_ID") or settings.github_client_id
+    client_secret = os.getenv("GITHUB_CLIENT_SECRET") or settings.github_client_secret
+    redirect_uri = os.getenv("GITHUB_OAUTH_REDIRECT_URL") or settings.github_oauth_redirect_url
+
+    if not client_id or not client_secret or not redirect_uri:
+        raise HTTPException(
+            status_code=503,
+            detail="GitHub OAuth client settings are not configured.",
+        )
+
+    token_response = httpx.post(
+        "https://github.com/login/oauth/access_token",
+        data={
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        headers={"Accept": "application/json"},
+        timeout=15.0,
+    )
+
+    token_response.raise_for_status()
+
+    token_payload = token_response.json()
+    access_token = token_payload.get("access_token")
+
+    if not access_token:
+        raise HTTPException(
+            status_code=502,
+            detail="GitHub OAuth token exchange did not return an access token.",
+        )
+
+    return {
+        "status": "oauth-success",
+        "message": "GitHub OAuth callback completed successfully.",
+        "token_received": True,
+        "token_type": token_payload.get("token_type"),
+        "scope": token_payload.get("scope"),
+    }
+
+@app.post("/api/v1/github/webhook")
+@app.post("/api/v1/webhooks/github")
+async def github_webhook(request: Request, x_hub_signature_256: str | None = Header(default=None)) -> dict[str, object]:
+    """Verify GitHub delivery signatures before processing pull_request events."""
+    secret = settings.github_webhook_secret or ""
+    if not secret or secret.startswith("replace-with"):
+        raise HTTPException(status_code=503, detail="Set GITHUB_WEBHOOK_SECRET before enabling GitHub webhooks.")
+    raw_body = await request.body()
+    expected_signature = "sha256=" + hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    if not x_hub_signature_256 or not hmac.compare_digest(expected_signature, x_hub_signature_256):
+        raise HTTPException(status_code=401, detail="Invalid GitHub webhook signature.")
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError as error:
+        raise HTTPException(status_code=400, detail="Webhook body must be valid JSON.") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook body must be a JSON object.")
+    pull_request = payload.get("pull_request")
+    repository = payload.get("repository")
+    installation = payload.get("installation")
+    if not isinstance(pull_request, dict) or not isinstance(repository, dict):
+        raise HTTPException(status_code=400, detail="Expected a GitHub pull_request webhook payload.")
+    if not isinstance(installation, dict):
+        raise HTTPException(status_code=400, detail="GitHub webhook is missing installation information.")
+    installation_id = installation.get("id")
+    if not installation_id:
+        raise HTTPException(status_code=400, detail="GitHub webhook installation ID is missing.")
+    action = str(payload.get("action", ""))
+    if action not in {"opened", "reopened", "synchronize", "closed"}:
+        return {"status": "ignored", "message": f"Webhook action '{action}' is not reviewed."}
+    base = pull_request.get("base", {})
+    head = pull_request.get("head", {})
+    return run_pull_request_agent(
+        {
+            "repository_url": repository.get("clone_url", ""),
+            "installation_id": str(installation_id),
+            "user_id": (
+                payload.get("sender", {}).get("login", "anonymous")
+                if isinstance(payload.get("sender"), dict)
+                else "anonymous"
+            ),
+            "pull_request_number": pull_request.get("number", 0),
+            "base_sha": base.get("sha", "") if isinstance(base, dict) else "",
+            "head_sha": head.get("sha", "") if isinstance(head, dict) else "",
+            "merged": bool(pull_request.get("merged")) and action == "closed",
+        }
+    )
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).resolve().parents[2] / "frontend", html=True), name="frontend")

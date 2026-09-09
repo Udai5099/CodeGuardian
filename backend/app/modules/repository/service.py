@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+import os
 import subprocess
 from threading import BoundedSemaphore, Lock
 from urllib.parse import urlparse
@@ -51,6 +52,65 @@ class RepositoryIntelligenceService:
             raise RepositoryAccessError(f"Not a Git repository: {path}")
         return str(path.resolve())
 
+    def resolve_github_repository(
+        self,
+        repository_url: str,
+        installation_token: str,
+        head_sha: str = "",
+        base_sha: str = "",
+    ) -> str:
+        """
+        Clone/fetch a GitHub repository using a GitHub App installation token.
+
+        The token is supplied to Git through environment-based Git configuration
+        so it is not persisted in the repository remote URL or .git/config.
+        """
+        repository_url = repository_url.strip()
+        installation_token = installation_token.strip()
+        head_sha = head_sha.strip()
+        base_sha = base_sha.strip()
+
+        if not repository_url:
+            raise RepositoryAccessError("GitHub repository URL is missing.")
+        if not installation_token:
+            raise RepositoryAccessError("GitHub installation token is missing.")
+
+        if self._cache_root is None:
+            raise RepositoryAccessError("Repository cache is not ready. Please retry in a moment.")
+
+        cache_root = self._cache_root
+        cache_key = sha256(repository_url.encode("utf-8")).hexdigest()[:16]
+        checkout = cache_root / cache_key
+        cache_root.mkdir(exist_ok=True)
+
+        with self._get_lock(cache_key), self._fetch_slots:
+            try:
+                if (checkout / ".git").is_dir():
+                    self._git_authenticated(["fetch", "--depth", "1", "origin"], checkout, installation_token)
+                else:
+                    self._git_authenticated(["clone", "--depth", "1", repository_url, str(checkout)], cache_root, installation_token)
+
+                revisions = [revision for revision in (base_sha, head_sha) if revision]
+                if revisions:
+                    self._git_authenticated(
+                        ["fetch", "--depth", "1", "origin", *revisions],
+                        checkout,
+                        installation_token,
+                    )
+
+                if head_sha:
+                    self._git(["checkout", "--detach", head_sha], checkout)
+
+            except subprocess.CalledProcessError as error:
+                detail = (
+                    error.stderr.strip()
+                    or error.stdout.strip()
+                    or "Git could not access the GitHub repository."
+                )
+                raise RepositoryAccessError(detail) from error
+
+        return str(checkout.resolve())
+
     @staticmethod
     def _is_remote_url(source: str) -> bool:
         parsed = urlparse(source)
@@ -73,7 +133,11 @@ class RepositoryIntelligenceService:
                 else:
                     self._git(["clone", "--depth", "1", repository_url, str(checkout)], cache_root)
             except subprocess.CalledProcessError as error:
-                detail = error.stderr.strip() or error.stdout.strip() or "Git could not fetch this repository."
+                detail = (
+                    error.stderr.strip()
+                    or error.stdout.strip()
+                    or "Git could not fetch this repository."
+                )
                 raise RepositoryAccessError(detail) from error
         return checkout
 
@@ -83,7 +147,45 @@ class RepositoryIntelligenceService:
 
     @staticmethod
     def _git(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(["git", *command], cwd=cwd, capture_output=True, text=True, check=True)
+        return subprocess.run(
+            ["git", *command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    @staticmethod
+    def _git_authenticated(
+        command: list[str],
+        cwd: Path,
+        installation_token: str,
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Run Git with an ephemeral HTTP Basic Authorization header.
+
+        The GitHub App installation token is never stored in the remote URL
+        or repository configuration.
+        """
+        import base64
+
+        credentials = f"x-access-token:{installation_token}".encode("utf-8")
+        authorization = base64.b64encode(credentials).decode("ascii")
+
+        env = os.environ.copy()
+
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = "http.extraheader"
+        env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {authorization}"
+
+        return subprocess.run(
+            ["git", *command],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
 
     def analyze(self, repository_path: str) -> RepositoryAnalysis:
         repo_path = Path(repository_path)
@@ -107,6 +209,7 @@ class RepositoryIntelligenceService:
         except (OSError, subprocess.CalledProcessError) as error:
             detail = getattr(error, "stderr", "") or "Git could not inspect this repository."
             raise RepositoryAccessError(detail.strip()) from error
+
         changed_files = len([line for line in status_output.stdout.splitlines() if line.strip()])
 
         return RepositoryAnalysis(
@@ -115,3 +218,20 @@ class RepositoryIntelligenceService:
             changed_files=changed_files,
             head_commit=head_commit_output.stdout.strip(),
         )
+
+    def fetch_revisions(self, repository_path: str, revisions: list[str]) -> None:
+        """Fetch PR commits when the checkout has an origin remote."""
+        revisions = [revision for revision in revisions if revision]
+        if not revisions:
+            return
+
+        try:
+            self._git(["remote", "get-url", "origin"], Path(repository_path))
+        except subprocess.CalledProcessError:
+            return
+
+        try:
+            self._git(["fetch", "--depth", "1", "origin", *revisions], Path(repository_path))
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.strip() or "Could not fetch the pull request commits."
+            raise RepositoryAccessError(detail) from error
