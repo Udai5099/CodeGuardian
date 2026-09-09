@@ -23,8 +23,8 @@ def create_app_jwt() -> str:
 
     now = int(dt.datetime.now(dt.timezone.utc).timestamp())
     payload = {
-        "iat": now - 60,
-        "exp": now + 600,
+        "iat": now - 30,
+        "exp": now + 570,
         "iss": settings.github_app_id,
     }
     private_key = _resolve_private_key()
