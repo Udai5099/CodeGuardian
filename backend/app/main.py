@@ -23,6 +23,7 @@ from backend.app.modules.agent.memory import create_repository_memory_store
 from backend.app.modules.agent.service import PullRequestReviewAgent
 from backend.app.modules.embeddings.service import EmbeddingRetrievalService
 from backend.app.modules.github.auth import get_installation_access_token
+from backend.app.modules.github.service import GitHubIntegrationService
 from backend.app.infrastructure.activity_store import RepositoryActivity, create_activity_store
 from backend.app.modules.indexing.service import IndexingService
 from backend.app.modules.knowledge.service import KnowledgeGraphService
@@ -360,6 +361,51 @@ def index_repository_vectors(payload: dict[str, str]) -> dict[str, object]:
     }
 
 
+def build_github_review_body(review: object) -> str:
+    """Build a human-readable GitHub PR review from a CodexGuardian review."""
+
+    lines = [
+        "## CodexGuardian Review",
+        "",
+        f"**Summary:** {review.summary}",
+        "",
+        f"**Confidence:** {review.confidence:.0%}",
+        "",
+        "### Findings",
+        "",
+    ]
+
+    if review.findings:
+        for finding in review.findings:
+            lines.append(
+                f"- **{finding.get('category', 'general')}**: "
+                f"{finding.get('message', '')}"
+            )
+    else:
+        lines.append("No findings were identified.")
+
+    if review.recommendation:
+        lines.extend(
+            [
+                "",
+                "### Recommendation",
+                "",
+                review.recommendation,
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "---",
+            "",
+            "_Generated automatically by CodexGuardian._",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
 def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
     installation_id = str(payload.get("installation_id") or "").strip()
     installation_token = str(payload.get("installation_token") or "").strip()
@@ -428,8 +474,49 @@ def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
         }
 
     review = app.state.pr_review_agent.review_pull_request(
-        repository_id, repository_path, pr_number, base_sha, head_sha
+        repository_id,
+        repository_path,
+        pr_number,
+        base_sha,
+        head_sha,
     )
+
+    github_review = None
+
+    if installation_token:
+        repository_url = str(payload.get("repository_url") or "").strip()
+
+        if repository_url:
+            github_service = GitHubIntegrationService(
+                installation_id=installation_id,
+                installation_token=installation_token,
+            )
+
+            repository_parts = repository_url.rstrip("/").split("/")
+
+            if len(repository_parts) >= 2:
+                owner = repository_parts[-2]
+                repo = repository_parts[-1].removesuffix(".git")
+
+                review_body = build_github_review_body(review)
+
+                try:
+                    github_review = github_service.submit_review(
+                        owner,
+                        repo,
+                        pr_number,
+                        review_body,
+                        event="COMMENT",
+                    )
+                except Exception as error:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=(
+                            "CodexGuardian completed the review, "
+                            f"but could not publish it to GitHub: {type(error).__name__}."
+                        ),
+                    ) from error
+
     activity = app.state.activity_store.record(
         RepositoryActivity(user_id, repository_id, repository_name, 0, "pull-request-reviewed", last_commit_sha=review.baseline_commit)
     )
@@ -446,6 +533,11 @@ def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
         "baseline_commit": review.baseline_commit,
         "recommendation": review.recommendation,
         "vector_index": {"storage": app.state.vector_service.storage_name, "files_indexed": vector_count},
+        "github_review": {
+            "posted": github_review is not None,
+            "review_id": github_review.get("id") if github_review else None,
+            "html_url": github_review.get("html_url") if github_review else None,
+        },
         "activity": activity_response(activity),
     }
 
