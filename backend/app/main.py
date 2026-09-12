@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.app.core.events import EventBus
 from backend.app.core.settings import settings
 from backend.app.infrastructure.idempotency import create_review_idempotency_store
-from backend.app.modules.ai.service import HeuristicReviewAgent
+from backend.app.modules.ai.service import HeuristicReviewAgent, create_configured_ai_reviewer
 from backend.app.modules.agent.memory import create_repository_memory_store
 from backend.app.modules.agent.service import PullRequestReviewAgent
 from backend.app.modules.embeddings.service import EmbeddingRetrievalService
@@ -92,7 +92,15 @@ app.add_middleware(
 )
 app.state.event_bus = EventBus()
 app.state.repository_service = RepositoryIntelligenceService()
-app.state.review_service = ReviewService()
+app.state.ai_reviewer = create_configured_ai_reviewer(
+    enabled=settings.ai_review_enabled,
+    provider=settings.ai_provider,
+    model=settings.ai_model,
+    api_key=settings.ai_api_key,
+    base_url=settings.ai_base_url,
+    timeout=settings.ai_timeout,
+)
+app.state.review_service = ReviewService(ai_reviewer=app.state.ai_reviewer)
 app.state.knowledge_service = KnowledgeGraphService()
 app.state.ai_agent = HeuristicReviewAgent()
 app.state.repository_memory = create_repository_memory_store(settings.redis_url)

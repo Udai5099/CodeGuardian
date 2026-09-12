@@ -25,6 +25,12 @@ class Settings:
     github_app_private_key_path: str | None = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
     github_app_private_key: str | None = os.getenv("GITHUB_APP_PRIVATE_KEY")
     review_background_enabled: bool = os.getenv("REVIEW_BACKGROUND_ENABLED", "false").lower() == "true"
+    ai_review_enabled: bool = os.getenv("AI_REVIEW_ENABLED", "false").lower() == "true"
+    ai_provider: str = os.getenv("AI_PROVIDER", "openai-compatible")
+    ai_model: str = os.getenv("AI_MODEL", "gpt-4o-mini")
+    ai_api_key: str | None = os.getenv("AI_API_KEY")
+    ai_base_url: str = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
+    ai_timeout: float = float(os.getenv("AI_TIMEOUT", "30"))
 
     @property
     def github_app_private_key_contents(self) -> str | None:

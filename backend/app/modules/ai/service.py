@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import json
 from typing import Any, Callable, Protocol
 
+from backend.app.modules.ai.providers import OpenAICompatibleProvider, StructuredLLMProvider
 from backend.app.modules.review.models import ReviewContext
 from backend.app.modules.review.validation import validate_context_findings
 
@@ -83,6 +85,54 @@ class MockAIReviewer(ContextAwareAIReviewer):
 
     def __init__(self, response: object) -> None:
         super().__init__(lambda _context: response, agent_name="mock-ai-reviewer")
+
+
+class LLMBackedAIReviewer:
+    """Diff-aware reviewer backed by a structured LLM provider."""
+
+    def __init__(self, provider: StructuredLLMProvider) -> None:
+        self._provider = provider
+
+    def review(self, context: ReviewContext) -> AIAgentResult:
+        try:
+            response = self._provider.generate_structured_review(context)
+            if isinstance(response, str):
+                response = json.loads(response)
+        except Exception as error:
+            return AIAgentResult(
+                agent_name="llm-ai-reviewer",
+                confidence=0.0,
+                suggested_fix="",
+                rationale=f"LLM review failed safely: {type(error).__name__}.",
+                findings=[],
+            )
+        return ContextAwareAIReviewer(
+            lambda _context: response,
+            agent_name="llm-ai-reviewer",
+        ).review(context)
+
+
+def create_configured_ai_reviewer(
+    *,
+    enabled: bool,
+    provider: str,
+    model: str,
+    api_key: str | None,
+    base_url: str,
+    timeout: float,
+) -> DiffAwareAIReviewer | None:
+    if not enabled or not api_key:
+        return None
+    if provider not in {"openai", "openai-compatible"}:
+        return None
+    return LLMBackedAIReviewer(
+        OpenAICompatibleProvider(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+        )
+    )
 
 
 class HeuristicReviewAgent:
