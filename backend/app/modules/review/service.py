@@ -11,7 +11,12 @@ from backend.app.modules.parser.service import ParserService
 @dataclass(frozen=True)
 class ReviewFinding:
     category: str
-    message: str
+    severity: str = "info"
+    file_path: str | None = None
+    line: int | None = None
+    message: str = ""
+    explanation: str = ""
+    suggestion: str | None = None
 
 
 @dataclass(frozen=True)
@@ -105,10 +110,20 @@ class ReviewService:
                 findings.append(
                     ReviewFinding(
                         category="style",
+                        severity="low",
+                        file_path=None,
+                        line=None,
                         message=(
                             "Potential style issue detected in the pull request diff using repository context; "
                             f"the repository context includes {knowledge_graph.file_count} files and "
                             f"{knowledge_graph.module_count} modules."
+                            ),
+                        explanation=(
+                            "The current parser detected a possible style issue in the changed code. "
+                            "Repository context was used during the review."
+                                    ),
+                        suggestion=(
+                            "Review the changed code for consistency with the repository's style conventions."
                         ),
                     )
                 )
@@ -117,11 +132,15 @@ class ReviewService:
             findings.append(
                 ReviewFinding(
                     category="review",
-                    message=(
-                        "No obvious issues found in the supplied pull request diff. "
-                        f"Repository context includes {knowledge_graph.file_count} "
-                        f"files and {knowledge_graph.module_count} modules."
+                    severity="info",
+                    file_path=None,
+                    line=None,
+                    message="No obvious issues found in the supplied pull request diff.",
+                    explanation=(
+                        f"Repository context includes {knowledge_graph.file_count} files and "
+                        f"{knowledge_graph.module_count} modules."
                     ),
+                    suggestion=None,
                 )
             )
 

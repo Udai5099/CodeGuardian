@@ -19,7 +19,7 @@ class PullRequestReview:
     baseline_commit: str | None
     recommendation: str
     summary: str
-    findings: list[dict[str, str]]
+    findings: list[dict[str, object]]
 
 
 class PullRequestReviewAgent:
@@ -90,7 +90,12 @@ class PullRequestReviewAgent:
         findings = [
             {
                 "category": finding.category,
+                "severity": finding.severity,
+                "file_path": finding.file_path,
+                "line": finding.line,
                 "message": finding.message,
+                "explanation": finding.explanation,
+                "suggestion": finding.suggestion,
             }
             for finding in review.findings
         ]

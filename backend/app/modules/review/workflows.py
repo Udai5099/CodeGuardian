@@ -141,7 +141,12 @@ class ReviewWorkflowEngine:
                 result["findings"] = [
                     {
                         "category": finding.category,
+                        "severity": finding.severity,
+                        "file_path": finding.file_path,
+                        "line": finding.line,
                         "message": finding.message,
+                        "explanation": finding.explanation,
+                        "suggestion": finding.suggestion,
                     }
                     for finding in review.findings
                 ]
