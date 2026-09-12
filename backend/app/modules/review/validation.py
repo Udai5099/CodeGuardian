@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from backend.app.modules.review.models import ReviewContext
+
 ALLOWED_CATEGORIES = {
     "security",
     "correctness",
@@ -50,3 +52,30 @@ def validate_findings(
         for finding in findings
         if validate_finding(finding, changed_file_list)
     ]
+
+
+def validate_context_findings(
+    findings: Iterable[Any],
+    context: ReviewContext,
+) -> list[dict[str, Any]]:
+    """Keep only findings that point to actual files and added diff lines."""
+    added_lines_by_file = {
+        file_context.file_path: {line.line_number for line in file_context.added_lines}
+        for file_context in context.files
+    }
+    valid: list[dict[str, Any]] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        file_path = finding.get("file_path")
+        line = finding.get("line")
+        if (
+            not isinstance(file_path, str)
+            or not isinstance(line, int)
+            or isinstance(line, bool)
+            or line not in added_lines_by_file.get(file_path, set())
+        ):
+            continue
+        if validate_finding(finding, added_lines_by_file):
+            valid.append(finding)
+    return valid

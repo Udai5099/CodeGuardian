@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from backend.app.modules.ai.service import DiffAwareAIReviewer
 from backend.app.modules.knowledge.service import KnowledgeGraphService
 from backend.app.modules.parser.service import ParserService
+from backend.app.modules.review.context import ReviewContextBuilder
 from backend.app.modules.review.models import ReviewFinding, ReviewResult
 from backend.app.modules.review.diff_analyzer import DiffAnalyzer
+from backend.app.modules.review.validation import validate_context_findings
+
+if TYPE_CHECKING:
+    from backend.app.modules.ai.service import AIAgentResult
 
 
 class ReviewService:
@@ -17,10 +24,12 @@ class ReviewService:
         parser_service: ParserService | None = None,
         knowledge_graph_service: KnowledgeGraphService | None = None,
         diff_analyzer: DiffAnalyzer | None = None,
+        ai_reviewer: DiffAwareAIReviewer | None = None,
     ) -> None:
         self._parser_service = parser_service or ParserService()
         self._knowledge_graph_service = knowledge_graph_service or KnowledgeGraphService()
         self._diff_analyzer = diff_analyzer or DiffAnalyzer()
+        self._ai_reviewer = ai_reviewer
 
     def review_diff(
         self,
@@ -132,12 +141,43 @@ class ReviewService:
             )
 
         findings = self._deduplicate_findings(findings)
+        findings = self._merge_ai_findings(
+            repository_path,
+            base_sha,
+            head_sha,
+            findings,
+        )
 
         return ReviewResult(
             review_id="review-001",
             summary=summary,
             findings=findings,
         )
+
+    def _merge_ai_findings(
+        self,
+        repository_path: str,
+        base_sha: str,
+        head_sha: str,
+        deterministic_findings: list[ReviewFinding],
+    ) -> list[ReviewFinding]:
+        if self._ai_reviewer is None:
+            return deterministic_findings
+
+        try:
+            context = ReviewContextBuilder(
+                repository_path,
+                base_sha,
+                head_sha,
+                deterministic_findings,
+            ).build()
+            ai_result = self._ai_reviewer.review(context)
+            valid_findings = validate_context_findings(ai_result.findings, context)
+            ai_findings = [ReviewFinding(**finding) for finding in valid_findings]
+        except Exception:
+            return deterministic_findings
+
+        return self._deduplicate_findings(deterministic_findings + ai_findings)
 
     @staticmethod
     def _deduplicate_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
