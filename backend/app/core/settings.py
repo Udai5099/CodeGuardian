@@ -24,6 +24,7 @@ class Settings:
     github_oauth_redirect_url: str | None = os.getenv("GITHUB_OAUTH_REDIRECT_URL")
     github_app_private_key_path: str | None = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH")
     github_app_private_key: str | None = os.getenv("GITHUB_APP_PRIVATE_KEY")
+    review_background_enabled: bool = os.getenv("REVIEW_BACKGROUND_ENABLED", "false").lower() == "true"
 
     @property
     def github_app_private_key_contents(self) -> str | None:

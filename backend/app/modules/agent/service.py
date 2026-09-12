@@ -3,10 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
+from typing import Any
 
 from backend.app.modules.agent.memory import RepositoryMemory, RepositoryMemoryStore
 from backend.app.modules.knowledge.service import KnowledgeGraphService
 from backend.app.modules.review.service import ReviewService
+from backend.app.modules.review.validation import validate_findings
 
 
 @dataclass(frozen=True)
@@ -30,10 +32,12 @@ class PullRequestReviewAgent:
         memory_store: RepositoryMemoryStore,
         knowledge_service: KnowledgeGraphService | None = None,
         review_service: ReviewService | None = None,
+        ai_agent: Any | None = None,
     ) -> None:
         self._memory_store = memory_store
         self._knowledge_service = knowledge_service or KnowledgeGraphService()
         self._review_service = review_service or ReviewService()
+        self._ai_agent = ai_agent
 
     def remember_merged_repository(self, repository_id: str, repository_path: str, pr_number: int) -> RepositoryMemory:
         graph = self._knowledge_service.build(repository_path)
@@ -99,6 +103,14 @@ class PullRequestReviewAgent:
             }
             for finding in review.findings
         ]
+        findings = validate_findings(findings, changed_files)
+        reasons.append(f"Finding validation retained {len(findings)} structured finding(s).")
+        if findings:
+            confidence += min(0.05, len(findings) * 0.01)
+            reasons.append("Validated deterministic findings improved review evidence quality.")
+
+        if self._ai_agent is not None:
+            reasons.append("AI reasoning was skipped until actual diff and repository context are available.")
 
         confidence = round(min(confidence, 0.95), 2)
 

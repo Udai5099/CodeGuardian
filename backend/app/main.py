@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import shutil
+import subprocess
 import tempfile
 import time
 from urllib.parse import urlencode
@@ -18,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 
 from backend.app.core.events import EventBus
 from backend.app.core.settings import settings
+from backend.app.infrastructure.idempotency import create_review_idempotency_store
 from backend.app.modules.ai.service import HeuristicReviewAgent
 from backend.app.modules.agent.memory import create_repository_memory_store
 from backend.app.modules.agent.service import PullRequestReviewAgent
@@ -29,6 +31,8 @@ from backend.app.modules.indexing.service import IndexingService
 from backend.app.modules.knowledge.service import KnowledgeGraphService
 from backend.app.modules.repository.service import RepositoryAccessError, RepositoryIntelligenceService
 from backend.app.modules.review.repository import ReviewRecord, ReviewRepository
+from backend.app.modules.review.queue import ReviewJobQueue
+from backend.app.modules.review.diff_analyzer import DiffAnalyzer
 from backend.app.modules.review.service import ReviewService
 from backend.app.modules.review.workflows import ReviewWorkflowEngine, WorkflowStep
 from backend.app.modules.vector.service import RepositoryVectorService, create_vector_store
@@ -59,6 +63,9 @@ async def lifespan(application: FastAPI):
         (cache_path / ".owner").write_text(str(os.getpid()), encoding="utf-8")
         application.state.repository_service.set_cache_root(cache_path)
         yield
+        review_queue = getattr(application.state, "review_queue", None)
+        if review_queue is not None:
+            review_queue.shutdown()
 
 
 def _windows_process_exists(pid: int) -> bool:
@@ -93,8 +100,10 @@ app.state.pr_review_agent = PullRequestReviewAgent(
     app.state.repository_memory,
     knowledge_service=app.state.knowledge_service,
     review_service=app.state.review_service,
+    ai_agent=app.state.ai_agent,
 )
 app.state.activity_store = create_activity_store(settings.database_url)
+app.state.review_idempotency_store = create_review_idempotency_store(settings.redis_url)
 app.state.vector_store = create_vector_store(settings.database_url)
 app.state.vector_service = RepositoryVectorService(app.state.vector_store)
 app.state.review_repository = ReviewRepository()
@@ -380,6 +389,13 @@ def index_repository_vectors(payload: dict[str, str]) -> dict[str, object]:
 def build_github_review_body(review: object) -> str:
     """Build a human-readable GitHub PR review from a CodexGuardian review."""
 
+    severity_markers = {
+        "critical": "🔴",
+        "high": "🔴",
+        "medium": "🟡",
+        "low": "🔵",
+        "info": "⚪",
+    }
     lines = [
         "## CodexGuardian Review",
         "",
@@ -393,10 +409,26 @@ def build_github_review_body(review: object) -> str:
 
     if review.findings:
         for finding in review.findings:
-            lines.append(
-                f"- **{finding.get('category', 'general')}**: "
-                f"{finding.get('message', '')}"
+            severity = str(finding.get("severity", "info")).lower()
+            marker = severity_markers.get(severity, "⚪")
+            category = str(finding.get("category", "review")).title()
+            location = finding.get("file_path") or "General review"
+            if finding.get("line") is not None:
+                location = f"{location}:{finding['line']}"
+            lines.extend(
+                [
+                    f"#### {marker} {severity.upper()} — {category}",
+                    "",
+                    f"**`{location}`**",
+                    "",
+                    f"**{finding.get('message', '')}**",
+                    "",
+                    str(finding.get("explanation", "")),
+                ]
             )
+            if finding.get("suggestion"):
+                lines.extend(["", f"**Suggestion:** {finding['suggestion']}"])
+            lines.append("")
     else:
         lines.append("No findings were identified.")
 
@@ -420,6 +452,51 @@ def build_github_review_body(review: object) -> str:
     )
 
     return "\n".join(lines)
+
+
+def build_github_inline_comments(
+    review: object,
+    repository_path: str,
+    base_sha: str,
+    head_sha: str,
+) -> list[dict[str, object]]:
+    command = ["git", "diff", "--unified=0"]
+    if base_sha and head_sha:
+        command.extend([base_sha, head_sha])
+    try:
+        diff_text = subprocess.run(
+            command,
+            cwd=repository_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return []
+
+    changed_lines = {
+        (line.file_path, line.line_number)
+        for line in DiffAnalyzer().parse_added_lines(diff_text)
+    }
+    comments: list[dict[str, object]] = []
+    for finding in review.findings:
+        file_path = finding.get("file_path")
+        line_number = finding.get("line")
+        if (file_path, line_number) not in changed_lines:
+            continue
+        comment_body = f"**{finding.get('message', '')}**\n\n{finding.get('explanation', '')}"
+        if finding.get("suggestion"):
+            comment_body += f"\n\n**Suggestion:** {finding['suggestion']}"
+        comments.append(
+            {
+                "body": comment_body,
+                "path": str(file_path).replace("\\", "/"),
+                "line": line_number,
+                "side": "RIGHT",
+                **({"commit_id": head_sha} if head_sha else {}),
+            }
+        )
+    return comments
 
 
 def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
@@ -515,6 +592,12 @@ def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
                 repo = repository_parts[-1].removesuffix(".git")
 
                 review_body = build_github_review_body(review)
+                inline_comments = build_github_inline_comments(
+                    review,
+                    repository_path,
+                    base_sha,
+                    head_sha,
+                )
 
                 try:
                     github_review = github_service.submit_review(
@@ -523,6 +606,7 @@ def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
                         pr_number,
                         review_body,
                         event="COMMENT",
+                        comments=inline_comments,
                     )
                 except Exception as error:
                     raise HTTPException(
@@ -669,7 +753,11 @@ def github_callback(code: str | None = None, state: str | None = None) -> dict[s
 
 @app.post("/api/v1/github/webhook")
 @app.post("/api/v1/webhooks/github")
-async def github_webhook(request: Request, x_hub_signature_256: str | None = Header(default=None)) -> dict[str, object]:
+async def github_webhook(
+    request: Request,
+    x_hub_signature_256: str | None = Header(default=None),
+    x_github_delivery: str | None = Header(default=None),
+) -> dict[str, object]:
     """Verify GitHub delivery signatures before processing pull_request events."""
     secret = settings.github_webhook_secret or ""
     if not secret or secret.startswith("replace-with"):
@@ -699,21 +787,38 @@ async def github_webhook(request: Request, x_hub_signature_256: str | None = Hea
         return {"status": "ignored", "message": f"Webhook action '{action}' is not reviewed."}
     base = pull_request.get("base", {})
     head = pull_request.get("head", {})
-    return run_pull_request_agent(
-        {
-            "repository_url": repository.get("clone_url", ""),
-            "installation_id": str(installation_id),
-            "user_id": (
-                payload.get("sender", {}).get("login", "anonymous")
-                if isinstance(payload.get("sender"), dict)
-                else "anonymous"
-            ),
-            "pull_request_number": pull_request.get("number", 0),
-            "base_sha": base.get("sha", "") if isinstance(base, dict) else "",
-            "head_sha": head.get("sha", "") if isinstance(head, dict) else "",
-            "merged": bool(pull_request.get("merged")) and action == "closed",
-        }
-    )
+    repository_url = str(repository.get("clone_url", ""))
+    pull_request_number = pull_request.get("number", 0)
+    head_sha = head.get("sha", "") if isinstance(head, dict) else ""
+    repository_name = str(repository.get("full_name") or repository_url)
+    stable_key = f"{repository_name}:{pull_request_number}:{head_sha}"
+    delivery_key = f"delivery:{x_github_delivery}" if x_github_delivery else ""
+    if not app.state.review_idempotency_store.claim(stable_key):
+        return {"status": "duplicate", "message": "This pull-request revision was already reviewed."}
+    if delivery_key and not app.state.review_idempotency_store.claim(delivery_key):
+        return {"status": "duplicate", "message": "This pull-request revision was already reviewed."}
+
+    review_payload = {
+        "repository_url": repository_url,
+        "installation_id": str(installation_id),
+        "user_id": (
+            payload.get("sender", {}).get("login", "anonymous")
+            if isinstance(payload.get("sender"), dict)
+            else "anonymous"
+        ),
+        "pull_request_number": pull_request_number,
+        "base_sha": base.get("sha", "") if isinstance(base, dict) else "",
+        "head_sha": head_sha,
+        "merged": bool(pull_request.get("merged")) and action == "closed",
+    }
+    if settings.review_background_enabled:
+        if not hasattr(app.state, "review_queue"):
+            app.state.review_queue = ReviewJobQueue(run_pull_request_agent)
+        app.state.review_queue.enqueue(review_payload)
+        return {"status": "queued", "message": "Pull-request review queued for background processing."}
+
+    result = run_pull_request_agent(review_payload)
+    return result
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).resolve().parents[2] / "frontend", html=True), name="frontend")

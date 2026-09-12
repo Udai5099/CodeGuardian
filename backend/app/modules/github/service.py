@@ -59,6 +59,7 @@ class GitHubIntegrationService:
         body: str,
         *,
         event: str = "COMMENT",
+        comments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return self.client().submit_review(
             owner,
@@ -66,4 +67,5 @@ class GitHubIntegrationService:
             pr_number,
             body,
             event=event,
+            comments=comments,
         )

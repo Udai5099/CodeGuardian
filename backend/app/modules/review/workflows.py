@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, TypedDict
 
 from backend.app.core.events import EventBus
+from backend.app.modules.review.models import ReviewFinding, ReviewResult
+from backend.app.modules.review.validation import validate_findings
 
 try:
     from langgraph.graph import END, StateGraph
@@ -138,7 +140,7 @@ class ReviewWorkflowEngine:
 
                 result["summary"] = review.summary
 
-                result["findings"] = [
+                findings = [
                     {
                         "category": finding.category,
                         "severity": finding.severity,
@@ -150,6 +152,7 @@ class ReviewWorkflowEngine:
                     }
                     for finding in review.findings
                 ]
+                result["findings"] = validate_findings(findings, changed_files)
 
             except Exception:
                 pass

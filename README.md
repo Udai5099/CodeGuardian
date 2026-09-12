@@ -88,6 +88,8 @@ Set `REDIS_URL` before starting the backend to persist repository memory across 
 
 `POST /api/v1/webhooks/github` accepts GitHub `pull_request` webhook payloads for `opened`, `reopened`, `synchronize`, and `closed` events. Before exposing this endpoint publicly, configure a webhook secret and signature verification at the deployment boundary. Without `REDIS_URL`, the application intentionally identifies its non-persistent in-memory development fallback in the API response.
 
+Set `REVIEW_BACKGROUND_ENABLED=true` only when a worker-capable deployment is ready; local development keeps webhook review processing synchronous by default.
+
 ## Key endpoints
 
 - `GET /health`

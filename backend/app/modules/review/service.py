@@ -1,29 +1,12 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
 from backend.app.modules.knowledge.service import KnowledgeGraphService
 from backend.app.modules.parser.service import ParserService
-
-
-@dataclass(frozen=True)
-class ReviewFinding:
-    category: str
-    severity: str = "info"
-    file_path: str | None = None
-    line: int | None = None
-    message: str = ""
-    explanation: str = ""
-    suggestion: str | None = None
-
-
-@dataclass(frozen=True)
-class ReviewResult:
-    review_id: str
-    summary: str
-    findings: list[ReviewFinding]
+from backend.app.modules.review.models import ReviewFinding, ReviewResult
+from backend.app.modules.review.diff_analyzer import DiffAnalyzer
 
 
 class ReviewService:
@@ -33,9 +16,11 @@ class ReviewService:
         self,
         parser_service: ParserService | None = None,
         knowledge_graph_service: KnowledgeGraphService | None = None,
+        diff_analyzer: DiffAnalyzer | None = None,
     ) -> None:
         self._parser_service = parser_service or ParserService()
         self._knowledge_graph_service = knowledge_graph_service or KnowledgeGraphService()
+        self._diff_analyzer = diff_analyzer or DiffAnalyzer()
 
     def review_diff(
         self,
@@ -128,6 +113,8 @@ class ReviewService:
                     )
                 )
 
+        findings.extend(self._diff_analyzer.analyze(diff_text))
+
         if not findings:
             findings.append(
                 ReviewFinding(
@@ -144,8 +131,21 @@ class ReviewService:
                 )
             )
 
+        findings = self._deduplicate_findings(findings)
+
         return ReviewResult(
             review_id="review-001",
             summary=summary,
             findings=findings,
         )
+
+    @staticmethod
+    def _deduplicate_findings(findings: list[ReviewFinding]) -> list[ReviewFinding]:
+        unique: list[ReviewFinding] = []
+        seen: set[tuple[str, str | None, int | None, str]] = set()
+        for finding in findings:
+            identity = (finding.category, finding.file_path, finding.line, finding.message)
+            if identity not in seen:
+                seen.add(identity)
+                unique.append(finding)
+        return unique

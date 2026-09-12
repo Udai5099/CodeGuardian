@@ -47,10 +47,22 @@ class GitHubAPIClient:
     def get_pull_request_commits(self, owner: str, repo: str, pr_number: int) -> list[dict[str, Any]]:
         return self.get(f"/repos/{owner}/{repo}/pulls/{pr_number}/commits")
 
-    def submit_review(self, owner: str, repo: str, pr_number: int, body: str, *, event: str = "COMMENT") -> dict[str, Any]:
+    def submit_review(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        body: str,
+        *,
+        event: str = "COMMENT",
+        comments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"body": body, "event": event}
+        if comments:
+            payload["comments"] = comments
         return self.post(
             f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews",
-            {"body": body, "event": event},
+            payload,
         )
 
     def create_issue_comment(self, owner: str, repo: str, pr_number: int, body: str) -> dict[str, Any]:
