@@ -532,12 +532,12 @@ def run_pull_request_agent(payload: dict[str, object]) -> dict[str, object]:
         "confidence_reasons": review.confidence_reasons,
         "baseline_commit": review.baseline_commit,
         "recommendation": review.recommendation,
-        "vector_index": {"storage": app.state.vector_service.storage_name, "files_indexed": vector_count},
         "github_review": {
             "posted": github_review is not None,
             "review_id": github_review.get("id") if github_review else None,
             "html_url": github_review.get("html_url") if github_review else None,
         },
+        "vector_index": {"storage": app.state.vector_service.storage_name, "files_indexed": vector_count},
         "activity": activity_response(activity),
     }
 
