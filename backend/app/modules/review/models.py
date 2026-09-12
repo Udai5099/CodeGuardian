@@ -26,3 +26,17 @@ class DiffLine:
     file_path: str
     line_number: int
     content: str
+
+
+@dataclass(frozen=True)
+class ReviewFileContext:
+    file_path: str
+    language: str
+    added_lines: list[DiffLine]
+    source_excerpt: str
+
+
+@dataclass(frozen=True)
+class ReviewContext:
+    files: list[ReviewFileContext]
+    deterministic_findings: list[ReviewFinding]
