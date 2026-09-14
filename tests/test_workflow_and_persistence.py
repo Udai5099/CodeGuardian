@@ -21,3 +21,23 @@ def test_review_workflow_engine_emits_event() -> None:
     workflow = ReviewWorkflowEngine(event_bus)
     workflow.run("review", {"status": "done"}, steps=[WorkflowStep("noop", lambda ctx: {**ctx, "status": "done"})])
     assert events == ["review.completed"]
+
+
+def test_review_workflow_uses_langgraph_state_machine() -> None:
+    workflow = ReviewWorkflowEngine(EventBus())
+    graph = workflow.build_graph()
+
+    result = graph.invoke({
+        "workflow_name": "review",
+        "repository_path": "/tmp/demo-repo",
+        "repository_id": "demo-repo",
+        "status": "pending",
+        "base_sha": "abc123",
+        "head_sha": "def456",
+        "changed_files": ["src/app.py"],
+    })
+
+    assert result["status"] == "completed"
+    assert result["workflow_name"] == "review"
+    assert result["confidence"] >= 0.5
+    assert "repository_id" in result
