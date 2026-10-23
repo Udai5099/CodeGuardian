@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from dataclasses import field
+import json
+from typing import Any, Callable, Protocol
+
+from backend.app.modules.ai.providers import OpenAICompatibleProvider, StructuredLLMProvider
+from backend.app.modules.review.models import ReviewContext
+from backend.app.modules.review.validation import validate_context_findings
 
 
 @dataclass(frozen=True)
@@ -10,6 +16,123 @@ class AIAgentResult:
     confidence: float
     suggested_fix: str
     rationale: str
+    summary: str = ""
+    findings: list[dict[str, Any]] = field(default_factory=list)
+
+
+class DiffAwareAIReviewer(Protocol):
+    """Contract for AI reviewers that reason over the actual review context."""
+
+    def review(self, context: ReviewContext) -> AIAgentResult: ...
+
+
+class ContextAwareAIReviewer:
+    """Adapt a structured AI response to the validated review contract."""
+
+    def __init__(
+        self,
+        responder: Callable[[ReviewContext], object],
+        *,
+        agent_name: str = "context-aware-ai-reviewer",
+    ) -> None:
+        self._responder = responder
+        self._agent_name = agent_name
+
+    def review(self, context: ReviewContext) -> AIAgentResult:
+        try:
+            response = self._responder(context)
+        except Exception as error:
+            return AIAgentResult(
+                agent_name=self._agent_name,
+                confidence=0.0,
+                suggested_fix="",
+                rationale=f"AI review failed safely: {type(error).__name__}.",
+                summary="",
+                findings=[],
+            )
+
+        if not isinstance(response, dict):
+            return self._empty_result("AI review returned malformed output.")
+
+        summary = response.get("summary")
+        raw_findings = response.get("findings")
+        if not isinstance(summary, str) or not isinstance(raw_findings, list):
+            return self._empty_result("AI review returned malformed output.")
+
+        findings = validate_context_findings(raw_findings, context)
+        return AIAgentResult(
+            agent_name=self._agent_name,
+            confidence=0.0,
+            suggested_fix="",
+            rationale="AI findings were validated against the supplied review context.",
+            summary=summary,
+            findings=findings,
+        )
+
+    def _empty_result(self, rationale: str) -> AIAgentResult:
+        return AIAgentResult(
+            agent_name=self._agent_name,
+            confidence=0.0,
+            suggested_fix="",
+            rationale=rationale,
+            summary="",
+            findings=[],
+        )
+
+
+class MockAIReviewer(ContextAwareAIReviewer):
+    """Deterministic, offline reviewer for contract and integration tests."""
+
+    def __init__(self, response: object) -> None:
+        super().__init__(lambda _context: response, agent_name="mock-ai-reviewer")
+
+
+class LLMBackedAIReviewer:
+    """Diff-aware reviewer backed by a structured LLM provider."""
+
+    def __init__(self, provider: StructuredLLMProvider) -> None:
+        self._provider = provider
+
+    def review(self, context: ReviewContext) -> AIAgentResult:
+        try:
+            response = self._provider.generate_structured_review(context)
+            if isinstance(response, str):
+                response = json.loads(response)
+        except Exception as error:
+            return AIAgentResult(
+                agent_name="llm-ai-reviewer",
+                confidence=0.0,
+                suggested_fix="",
+                rationale=f"LLM review failed safely: {type(error).__name__}.",
+                findings=[],
+            )
+        return ContextAwareAIReviewer(
+            lambda _context: response,
+            agent_name="llm-ai-reviewer",
+        ).review(context)
+
+
+def create_configured_ai_reviewer(
+    *,
+    enabled: bool,
+    provider: str,
+    model: str,
+    api_key: str | None,
+    base_url: str,
+    timeout: float,
+) -> DiffAwareAIReviewer | None:
+    if not enabled or not api_key:
+        return None
+    if provider not in {"openai", "openai-compatible"}:
+        return None
+    return LLMBackedAIReviewer(
+        OpenAICompatibleProvider(
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            timeout=timeout,
+        )
+    )
 
 
 class HeuristicReviewAgent:

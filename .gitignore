@@ -3,3 +3,6 @@ __pycache__/
 *.log
 .venv/
 .pytest_cache/
+.env
+*.pem
+.test-tmp*/

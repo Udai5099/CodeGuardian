@@ -24,6 +24,21 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+## 4.1 Start PostgreSQL and Redis (Docker Desktop)
+
+```powershell
+docker compose up -d
+```
+
+The root `.env` supplies the development connection variables. Keep it outside `frontend` and `backend`; do not put real production secrets in source control.
+
+## 4.2 Configure the GitHub pull-request agent
+
+1. Create a GitHub App with **Pull requests: Read-only** and **Contents: Read-only** permissions.
+2. Set `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, and a strong `GITHUB_WEBHOOK_SECRET` in the root `.env`.
+3. Set the GitHub App webhook URL to `https://YOUR_PUBLIC_DOMAIN/api/v1/webhooks/github`, select **Pull requests**, and use the same secret.
+4. Restart the backend after changing `.env`.
+
 ## 5. Run the backend
 
 ```powershell
@@ -75,3 +90,4 @@ curl -X POST http://localhost:8000/api/v1/rag/retrieve -H "Content-Type: applica
 ```powershell
 curl -X POST http://localhost:8000/api/v1/review/ai -H "Content-Type: application/json" -d "{\"repository_path\":\"C:/path/to/repo\"}"
 ```
+<!-- webhook review test -->

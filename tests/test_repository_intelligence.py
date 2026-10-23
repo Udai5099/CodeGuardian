@@ -1,5 +1,6 @@
 import subprocess
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
@@ -60,3 +61,51 @@ def test_workflow_engine_emits_domain_event() -> None:
 
     assert result["status"] == "reviewed"
     assert events == ["reviewed"]
+
+
+def test_github_webhook_alias_route_is_registered() -> None:
+    response = client.post(
+        "/api/v1/github/webhook",
+        json={"action": "opened"},
+        headers={"X-Hub-Signature-256": "sha256=invalid"},
+    )
+    assert response.status_code != 404
+
+
+def test_github_oauth_callback_route_is_registered(monkeypatch) -> None:
+    class DummyResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"access_token": "gho_example_token", "token_type": "bearer", "scope": "repo"}
+
+    def fake_post(url, data=None, headers=None, timeout=None):
+        assert url == "https://github.com/login/oauth/access_token"
+        assert data["client_id"] == "test-client-id"
+        assert data["client_secret"] == "test-client-secret"
+        assert data["code"] == "test-code"
+        assert data["redirect_uri"]
+        assert timeout == 15.0
+        return DummyResponse()
+
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("GITHUB_OAUTH_REDIRECT_URL", "https://example.test/api/v1/github/callback")
+    monkeypatch.setattr("httpx.post", fake_post)
+
+    auth_response = client.get("/api/v1/github/authorize", follow_redirects=False)
+    assert auth_response.status_code in {301, 302, 307, 308}
+    location = auth_response.headers["location"]
+    state = parse_qs(urlparse(location).query)["state"][0]
+
+    response = client.get(f"/api/v1/github/callback?code=test-code&state={state}")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "oauth-success"
+    assert payload["token_received"] is True
+    assert payload["token_type"] == "bearer"
+    assert payload["scope"] == "repo"
+    assert "access_token" not in payload
